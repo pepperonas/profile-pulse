@@ -132,22 +132,31 @@ const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX = 10; // max 10 requests per IP per minute
 
-function rateLimit(req, res, next) {
-  const ip = `${req.path}|${req.ip || req.socket.remoteAddress}`;
-  const now = Date.now();
-  if (rateLimitMap.size > 10000) rateLimitMap.clear();
-  const entry = rateLimitMap.get(ip);
-
-  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
-    rateLimitMap.set(ip, { windowStart: now, count: 1 });
-    return next();
+function sweepRateLimit(now) {
+  for (const [k, v] of rateLimitMap) {
+    if (now - v.windowStart > RATE_LIMIT_WINDOW_MS) rateLimitMap.delete(k);
   }
+}
 
-  entry.count++;
-  if (entry.count > RATE_LIMIT_MAX) {
-    return res.status(429).json({ valid: false, error: 'Too many requests. Try again later.' });
-  }
-  next();
+// One bucket per NAMED route, not per raw path: Express matches routes
+// case-insensitively and ignores a trailing slash, so `/API/validate-license/`
+// would otherwise get a fresh bucket for every spelling.
+function rateLimit(bucket) {
+  return function rateLimitMiddleware(req, res, next) {
+    const now = Date.now();
+    if (rateLimitMap.size > 10000) sweepRateLimit(now); // expire, never reset live counters
+    const id = `${bucket}|${req.ip || req.socket.remoteAddress}`;
+    const entry = rateLimitMap.get(id);
+    if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+      rateLimitMap.set(id, { windowStart: now, count: 1 });
+      return next();
+    }
+    entry.count++;
+    if (entry.count > RATE_LIMIT_MAX) {
+      return res.status(429).json({ valid: false, error: 'Too many requests. Try again later.' });
+    }
+    next();
+  };
 }
 
 // --- Create Checkout Session ---
@@ -181,7 +190,7 @@ async function createCheckoutSession(plan, email) {
   return stripe.checkout.sessions.create(params);
 }
 
-app.post('/api/create-checkout', rateLimit, async (req, res) => {
+app.post('/api/create-checkout', rateLimit('checkout'), async (req, res) => {
   const plan = req.body?.plan;
   if (!PLANS.has(plan)) return res.status(400).json({ error: 'Unknown plan' });
   const email = typeof req.body.email === 'string' && EMAIL_RE.test(req.body.email.trim()) ? req.body.email.trim() : undefined;
@@ -196,7 +205,7 @@ app.post('/api/create-checkout', rateLimit, async (req, res) => {
 
 // --- Validate License ---
 
-app.post('/api/validate-license', rateLimit, (req, res) => {
+app.post('/api/validate-license', rateLimit('validate'), (req, res) => {
   const { key } = req.body;
 
   if (!key) {
@@ -426,7 +435,7 @@ app.get('/', (req, res) => {
 
 // --- Checkout redirect routes ---
 
-app.get('/checkout/monthly', rateLimit, async (req, res) => {
+app.get('/checkout/monthly', rateLimit('checkout'), async (req, res) => {
   try {
     const session = await createCheckoutSession('monthly');
     res.redirect(303, session.url);
@@ -436,7 +445,7 @@ app.get('/checkout/monthly', rateLimit, async (req, res) => {
   }
 });
 
-app.get('/checkout/lifetime', rateLimit, async (req, res) => {
+app.get('/checkout/lifetime', rateLimit('checkout'), async (req, res) => {
   try {
     const session = await createCheckoutSession('lifetime');
     res.redirect(303, session.url);
@@ -575,7 +584,7 @@ app.get('/kuendigen', (req, res) => {
     <p><a href="/">Zurück zur Startseite</a></p>`));
 });
 
-app.post('/kuendigen', express.urlencoded({ extended: false, limit: '4kb' }), rateLimit, async (req, res) => {
+app.post('/kuendigen', express.urlencoded({ extended: false, limit: '4kb' }), rateLimit('kuendigen'), async (req, res) => {
   const key = String(req.body?.key || '').trim().toUpperCase();
   const email = String(req.body?.email || '').trim().toLowerCase();
   const lic = loadLicenses().find(
