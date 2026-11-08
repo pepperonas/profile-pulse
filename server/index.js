@@ -29,8 +29,12 @@ if (fs.existsSync(envPath)) {
 }
 
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { handleEvent, APP } = require('./webhook-handler');
 
 const app = express();
+// nginx on the same host forwards the client address; without this every
+// request looks like 127.0.0.1 and all customers share one rate-limit bucket.
+app.set('trust proxy', 'loopback');
 const PORT = process.env.PORT || 3000;
 const LICENSES_FILE = path.join(__dirname, 'licenses.json');
 
@@ -46,7 +50,12 @@ function loadLicenses() {
 }
 
 function saveLicenses(licenses) {
-  fs.writeFileSync(LICENSES_FILE, JSON.stringify(licenses, null, 2));
+  // Write-then-rename: a crash mid-write must not leave a truncated file,
+  // because loadLicenses() would read it as [] and the next save would
+  // wipe every issued key.
+  const tmp = `${LICENSES_FILE}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(licenses, null, 2));
+  fs.renameSync(tmp, LICENSES_FILE);
 }
 
 function generateLicenseKey() {
@@ -78,49 +87,14 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    if (
-      event.type === 'checkout.session.completed' ||
-      event.type === 'invoice.payment_succeeded'
-    ) {
-      const session = event.data.object;
-      const email = session.customer_email || session.customer_details?.email;
-      const mode = session.mode; // 'subscription' or 'payment'
-
-      if (email) {
-        const licenses = loadLicenses();
-        const licenseKey = generateLicenseKey();
-        licenses.push({
-          key: licenseKey,
-          email,
-          type: mode === 'subscription' ? 'monthly' : 'lifetime',
-          createdAt: new Date().toISOString(),
-          active: true,
-          stripeSessionId: session.id,
-          stripeCustomerId: session.customer || null,
-        });
-        saveLicenses(licenses);
-        console.log(`License created for ${email}: ${licenseKey} (${mode})`);
-      }
-    }
-
-    if (event.type === 'customer.subscription.deleted') {
-      const subscription = event.data.object;
-      const customerId = subscription.customer;
-      const licenses = loadLicenses();
-      let deactivated = 0;
-      const updated = licenses.map((lic) => {
-        if (
-          lic.type === 'monthly' &&
-          lic.active &&
-          lic.stripeCustomerId === customerId
-        ) {
-          lic.active = false;
-          deactivated++;
-        }
-        return lic;
-      });
-      saveLicenses(updated);
-      console.log(`Subscription cancelled for customer ${customerId}, ${deactivated} license(s) deactivated`);
+    try {
+      const result = handleEvent(event, loadLicenses(), { generateKey: generateLicenseKey });
+      if (result.changed) saveLicenses(result.licenses);
+      for (const line of result.log) console.log(`[${event.type}] ${line}`);
+    } catch (err) {
+      // 500 makes Stripe retry; handleEvent is idempotent, so a retry is safe.
+      console.error(`Webhook handling failed for ${event.id}: ${err.message}`);
+      return res.status(500).json({ received: false });
     }
 
     res.json({ received: true });
@@ -159,8 +133,9 @@ const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX = 10; // max 10 requests per IP per minute
 
 function rateLimit(req, res, next) {
-  const ip = req.ip || req.connection.remoteAddress;
+  const ip = `${req.path}|${req.ip || req.socket.remoteAddress}`;
   const now = Date.now();
+  if (rateLimitMap.size > 10000) rateLimitMap.clear();
   const entry = rateLimitMap.get(ip);
 
   if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
@@ -177,34 +152,45 @@ function rateLimit(req, res, next) {
 
 // --- Create Checkout Session ---
 
-app.post('/api/create-checkout', async (req, res) => {
-  const { plan } = req.body; // 'monthly' or 'lifetime'
+const PLANS = new Set(['monthly', 'lifetime']);
+const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,24}$/;
 
+function baseUrl() {
+  return process.env.SERVER_URL || `http://localhost:${PORT}`;
+}
+
+async function createCheckoutSession(plan, email) {
+  const metadata = { app: APP, plan };
+  const params = {
+    payment_method_types: ['card'],
+    customer_email: email || undefined,
+    success_url: `${baseUrl()}/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${baseUrl()}/cancel`,
+    metadata,
+  };
+  if (plan === 'monthly') {
+    params.mode = 'subscription';
+    params.line_items = [{ price: process.env.STRIPE_PRICE_MONTHLY, quantity: 1 }];
+    params.subscription_data = { metadata };
+  } else {
+    params.mode = 'payment';
+    params.line_items = [{ price: process.env.STRIPE_PRICE_LIFETIME, quantity: 1 }];
+    params.payment_intent_data = { metadata };
+    params.customer_creation = 'always';
+  }
+  return stripe.checkout.sessions.create(params);
+}
+
+app.post('/api/create-checkout', rateLimit, async (req, res) => {
+  const plan = req.body?.plan;
+  if (!PLANS.has(plan)) return res.status(400).json({ error: 'Unknown plan' });
+  const email = typeof req.body.email === 'string' && EMAIL_RE.test(req.body.email.trim()) ? req.body.email.trim() : undefined;
   try {
-    const params = {
-      payment_method_types: ['card'],
-      customer_email: req.body.email || undefined,
-      success_url: `${process.env.SERVER_URL || `http://localhost:${PORT}`}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.SERVER_URL || `http://localhost:${PORT}`}/cancel`,
-    };
-
-    if (plan === 'monthly') {
-      params.mode = 'subscription';
-      params.line_items = [
-        { price: process.env.STRIPE_PRICE_MONTHLY, quantity: 1 },
-      ];
-    } else {
-      params.mode = 'payment';
-      params.line_items = [
-        { price: process.env.STRIPE_PRICE_LIFETIME, quantity: 1 },
-      ];
-    }
-
-    const session = await stripe.checkout.sessions.create(params);
+    const session = await createCheckoutSession(plan, email);
     res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
     console.error(`Checkout error: ${err.message}`);
-    res.status(500).json({ error: err.message });
+    res.status(502).json({ error: 'Checkout currently unavailable' });
   }
 });
 
@@ -431,7 +417,7 @@ app.get('/', (req, res) => {
       <div class="footer">
         <p>&copy; 2026 Martin Pfeffer &mdash; <a href="https://celox.io">celox.io</a></p>
         <p><a href="https://github.com/pepperonas/profile-pulse">GitHub</a></p>
-        <p style="margin-top: 0.8rem;"><a href="/impressum">Impressum</a> &middot; <a href="/datenschutz">Datenschutz</a> &middot; <a href="/agb">AGB</a></p>
+        <p style="margin-top: 0.8rem;"><a href="/impressum">Impressum</a> &middot; <a href="/datenschutz">Datenschutz</a> &middot; <a href="/agb">AGB</a> &middot; <a href="/kuendigen">Verträge hier kündigen</a></p>
       </div>
     </body>
     </html>
@@ -440,33 +426,23 @@ app.get('/', (req, res) => {
 
 // --- Checkout redirect routes ---
 
-app.get('/checkout/monthly', async (req, res) => {
+app.get('/checkout/monthly', rateLimit, async (req, res) => {
   try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      mode: 'subscription',
-      line_items: [{ price: process.env.STRIPE_PRICE_MONTHLY, quantity: 1 }],
-      success_url: `${process.env.SERVER_URL || `http://localhost:${PORT}`}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.SERVER_URL || `http://localhost:${PORT}`}/cancel`,
-    });
+    const session = await createCheckoutSession('monthly');
     res.redirect(303, session.url);
   } catch (err) {
-    res.status(500).send(`Error: ${err.message}`);
+    console.error(`Checkout error: ${err.message}`);
+    res.status(502).send('Checkout ist gerade nicht verfügbar. Bitte später erneut versuchen.');
   }
 });
 
-app.get('/checkout/lifetime', async (req, res) => {
+app.get('/checkout/lifetime', rateLimit, async (req, res) => {
   try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      mode: 'payment',
-      line_items: [{ price: process.env.STRIPE_PRICE_LIFETIME, quantity: 1 }],
-      success_url: `${process.env.SERVER_URL || `http://localhost:${PORT}`}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.SERVER_URL || `http://localhost:${PORT}`}/cancel`,
-    });
+    const session = await createCheckoutSession('lifetime');
     res.redirect(303, session.url);
   } catch (err) {
-    res.status(500).send(`Error: ${err.message}`);
+    console.error(`Checkout error: ${err.message}`);
+    res.status(502).send('Checkout ist gerade nicht verfügbar. Bitte später erneut versuchen.');
   }
 });
 
@@ -551,6 +527,88 @@ const legalPageStyle = `
 `;
 
 // --- Impressum ---
+
+// --- Cancellation (§ 312k BGB: "Verträge hier kündigen") ---
+
+function escapeHtml(v) {
+  return String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function simplePage(title, bodyHtml) {
+  return `<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)} – ProfilePulse</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0a; color: #e5e5e5; margin: 0; padding: 3rem 1rem; }
+    main { max-width: 560px; margin: 0 auto; }
+    h1 { color: #fff; font-size: 1.6rem; }
+    label { display: block; margin: 1.2rem 0 0.4rem; color: #bbb; }
+    input { width: 100%; box-sizing: border-box; padding: 0.75rem; border-radius: 8px; border: 1px solid #444; background: #111; color: #fff; font-size: 1rem; }
+    button { margin-top: 1.5rem; padding: 0.85rem 1.5rem; border: 0; border-radius: 8px; background: #2563eb; color: #fff; font-size: 1rem; cursor: pointer; }
+    p { line-height: 1.6; }
+    a { color: #60a5fa; }
+    .note { color: #999; font-size: 0.9rem; }
+  </style>
+</head>
+<body><main>${bodyHtml}</main></body>
+</html>`;
+}
+
+app.get('/kuendigen', (req, res) => {
+  res.send(simplePage('Vertrag kündigen', `
+    <h1>Monats-Abo kündigen</h1>
+    <p>Gib deinen Lizenzschlüssel und die E-Mail-Adresse ein, mit der du bezahlt hast.
+       Das Abo endet zum Ende des laufenden Abrechnungszeitraums; bis dahin bleibt die Lizenz gültig.</p>
+    <form method="post" action="/kuendigen">
+      <label for="key">Lizenzschlüssel</label>
+      <input id="key" name="key" required autocomplete="off" placeholder="PULSE-XXXX-XXXX-XXXX-XXXX" maxlength="40">
+      <label for="email">E-Mail-Adresse</label>
+      <input id="email" name="email" type="email" required autocomplete="email" maxlength="254">
+      <button type="submit">Jetzt kündigen</button>
+    </form>
+    <p class="note">Probleme? Schreib an <a href="mailto:martin.pfeffer@celox.io">martin.pfeffer@celox.io</a> – auch eine formlose Kündigung per E-Mail ist jederzeit möglich.
+       Lifetime-Lizenzen sind Einmalkäufe und müssen nicht gekündigt werden.</p>
+    <p><a href="/">Zurück zur Startseite</a></p>`));
+});
+
+app.post('/kuendigen', express.urlencoded({ extended: false, limit: '4kb' }), rateLimit, async (req, res) => {
+  const key = String(req.body?.key || '').trim().toUpperCase();
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const lic = loadLicenses().find(
+    (l) => l.key === key && String(l.email || '').toLowerCase() === email && l.type === 'monthly' && l.stripeSubscriptionId
+  );
+  if (!lic) {
+    return res.status(404).send(simplePage('Kündigung', `
+      <h1>Kein passendes Abo gefunden</h1>
+      <p>Zu dieser Kombination aus Lizenzschlüssel und E-Mail-Adresse gibt es kein laufendes Monats-Abo.
+         Bitte prüfe die Eingaben oder kündige formlos per E-Mail an
+         <a href="mailto:martin.pfeffer@celox.io">martin.pfeffer@celox.io</a>.</p>
+      <p><a href="/kuendigen">Erneut versuchen</a></p>`));
+  }
+  try {
+    const sub = await stripe.subscriptions.update(lic.stripeSubscriptionId, { cancel_at_period_end: true });
+    const endTs = sub.cancel_at || sub.items?.data?.[0]?.current_period_end || sub.current_period_end;
+    const end = endTs ? new Date(endTs * 1000).toLocaleDateString('de-DE', { timeZone: 'Europe/Berlin' }) : null;
+    console.log(`[kuendigen] ${lic.key} cancel_at_period_end set (${lic.stripeSubscriptionId})`);
+    res.send(simplePage('Kündigung bestätigt', `
+      <h1>Kündigung bestätigt</h1>
+      <p>Dein Monats-Abo ist gekündigt${end ? ` und endet am <strong>${escapeHtml(end)}</strong>` : ' und endet zum Ende des laufenden Abrechnungszeitraums'}.
+         Bis dahin bleibt deine Lizenz gültig, danach wird nichts mehr abgebucht.</p>
+      <p>Eingang der Kündigung: ${escapeHtml(new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' }))}.
+         Bitte bewahre diese Seite (Screenshot oder Druck) als Bestätigung auf.</p>
+      <p><a href="/">Zurück zur Startseite</a></p>`));
+  } catch (err) {
+    console.error(`[kuendigen] Stripe error for ${lic.key}: ${err.message}`);
+    res.status(502).send(simplePage('Kündigung', `
+      <h1>Kündigung gerade nicht möglich</h1>
+      <p>Bitte versuche es später erneut oder kündige formlos per E-Mail an
+         <a href="mailto:martin.pfeffer@celox.io">martin.pfeffer@celox.io</a>.</p>`));
+  }
+});
 
 app.get('/impressum', (req, res) => {
   res.send(`
@@ -710,7 +768,7 @@ app.get('/agb', (req, res) => {
         <p>Nach erfolgreicher Zahlung erhält der Kunde einen Lizenzschlüssel. Dieser ist persönlich, nicht übertragbar und darf nicht an Dritte weitergegeben werden. Pro Lizenz ist die Nutzung auf einem Gerät gestattet.</p>
 
         <h2>§ 6 Kündigung</h2>
-        <p>Das Monats-Abo kann jederzeit zum Ende des laufenden Abrechnungszeitraums gekündigt werden. Die Kündigung erfolgt über das Stripe-Kundenportal oder per E-Mail an martin.pfeffer@celox.io.</p>
+        <p>Das Monats-Abo kann jederzeit zum Ende des laufenden Abrechnungszeitraums gekündigt werden. Die Kündigung erfolgt über die Seite <a href="/kuendigen">„Verträge hier kündigen“</a> (Lizenzschlüssel und E-Mail-Adresse genügen) oder formlos per E-Mail an martin.pfeffer@celox.io.</p>
 
         <h2>§ 7 Widerrufsrecht</h2>
         <p>Als Verbraucher hast du ein 14-tägiges Widerrufsrecht ab dem Kaufdatum. Der Widerruf kann formlos per E-Mail an martin.pfeffer@celox.io erklärt werden. Nach Widerruf wird der Lizenzschlüssel deaktiviert und der Kaufpreis erstattet.</p>

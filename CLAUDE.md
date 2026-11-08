@@ -10,7 +10,7 @@ ProfilePulse automates the 7-day availability confirmation on malt.de using Play
 
 ```bash
 npm install && npx playwright install chromium   # Install dependencies
-npm test                                          # Run 29 unit tests (Node.js built-in test runner)
+npm test                                          # Run 48 unit tests (Node.js built-in test runner)
 npm run confirm                                   # Run availability confirmation once
 npm run setup                                     # Google SSO login (opens browser)
 npm run setup:login                               # Email/password login (terminal)
@@ -38,7 +38,8 @@ src/status.js                 Checks scheduler status per platform, session, las
 src/logger.js                 Daily rotating logs (pulse-YYYY-MM-DD.log), 4 levels
 src/utils.js                  ensureDir, cleanupScreenshots (max 20 files)
 
-server/index.js               License server (Express): Stripe webhooks generate PULSE-XXXX keys,
+server/index.js               License server (Express): Stripe webhook → webhook-handler.js,
+server/webhook-handler.js     Pure Stripe event logic (tested in test/webhook-handler.test.js),
                               /api/validate-license with rate limiting (10/min/IP),
                               landing page with Impressum/Datenschutz/AGB,
                               master key via MASTER_KEY env var (not in source)
@@ -62,7 +63,7 @@ scripts/*-windows.ps1         Windows: Task Scheduler task "ProfilePulse"
 The license server (`server/`) is deployed independently on VPS at `profilepulse.celox.io:3008` behind Nginx with Let's Encrypt SSL. PM2 process name: `profilepulse-license`. Deploy via:
 
 ```bash
-scp server/index.js celox:/var/www/profilepulse-license/
+scp server/index.js server/webhook-handler.js celox:/var/www/profilepulse-license/
 ssh celox 'pm2 restart profilepulse-license'
 ```
 
@@ -80,3 +81,22 @@ Static assets (favicon.svg, profilepulse.png) must also be copied to the VPS ser
 ## Server Environment Variables (VPS only)
 
 `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_MONTHLY`, `STRIPE_PRICE_LIFETIME`, `PORT`, `SERVER_URL`, `MASTER_KEY`
+
+## Stripe rules (since 2026-11-08 audit)
+
+The Stripe account is SHARED with other apps (kiezform, apply-forge, via.camp, …) — every webhook endpoint
+receives every app's events. Therefore:
+
+- Licenses are only created from checkout sessions with `metadata.app === 'profilepulse'`
+  (set in `createCheckoutSession`, also on `subscription_data` / `payment_intent_data`). Before this,
+  every foreign purchase minted a lifetime key (one such key exists in licenses.json from 2026-10-31,
+  an ApplyForge purchase — harmless, nobody knows the key).
+- `invoice.*` never creates a lifetime license (invoices have no `mode`; every monthly renewal used to
+  mint one). Monthly licenses follow the subscription status by `stripeSubscriptionId`.
+- Full refund / dispute deactivates by `stripePaymentIntentId`; won dispute restores.
+  Licenses created before 2026-11-08 have no payment-intent id → refunds there stay manual.
+- The Stripe webhook endpoint must subscribe to: `checkout.session.completed`,
+  `checkout.session.async_payment_succeeded`, `invoice.paid`, `customer.subscription.updated`,
+  `customer.subscription.deleted`, `charge.refunded`, `charge.dispute.created`, `charge.dispute.closed`.
+- `/kuendigen` is the § 312k BGB cancellation button (license key + email → `cancel_at_period_end`).
+- `app.set('trust proxy', 'loopback')` — without it all clients shared one rate-limit bucket behind nginx.
